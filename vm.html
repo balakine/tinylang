@@ -48,9 +48,10 @@ if (a % b == 1) {
 (() => {
   // ---------------- Bytecode ISA ----------------
   const OP = Object.freeze({
-    PUSH: 0x01,  // imm32
-    LOAD: 0x02,  // imm32 (slot)
-    STORE:0x03,  // imm32 (slot)
+    ENTER: 0x00,        // imm32: number of locals
+    PUSH:  0x01,        // imm32
+    LOADL: 0x02,        // imm32 (frame offset)
+    STOREL:0x03,        // imm32 (frame offset)
     ADD:  0x10, SUB:0x11, MUL:0x12, DIV:0x13, MOD:0x14,
     NEG:  0x15, NOT:0x16,
     EQ:   0x20, NE: 0x21, LT: 0x22, LE: 0x23, GT: 0x24, GE: 0x25,
@@ -66,17 +67,36 @@ if (a % b == 1) {
 
   // ---------------- VM ----------------
   function runVM(bytecode, {stdout}) {
-    const memI32 = new Int32Array(0); // not using a heap; locals are in slots via LOAD/STORE.
-    const stack = [];
+    const stack = [];  // operand stack + locals
     let ip = 0;
+    let FP = 0;        // index of first local in current frame
     const u8 = bytecode;
     const read32 = () => { const v = u8[ip]|(u8[ip+1]<<8)|(u8[ip+2]<<16)|(u8[ip+3]<<24); ip+=4; return v|0; };
 
     for(;;){
       const op = u8[ip++]; switch(op){
+        case OP.ENTER: {
+          const n = read32();
+          for (let i=0;i<n;i++) stack.push(0);
+          FP = stack.length - n;
+          break;
+        }
         case OP.PUSH: stack.push(read32()); break;
-        case OP.LOAD: { const s=read32(); stack.push(thisFrame[s]|0); break; }
-        case OP.STORE:{ const s=read32(); thisFrame[s]= (stack.pop()|0); break; }
+        case OP.LOADL: {
+          const k = read32();
+          const idx = FP + (k|0);
+          if (idx < 0 || idx >= stack.length) throw new Error("LOADL OOB");
+          stack.push(stack[idx]|0);
+          break;
+        }
+        case OP.STOREL: {
+          const k = read32();
+          const v = stack.pop()|0;
+          const idx = FP + (k|0);
+          if (idx < 0 || idx >= stack.length) throw new Error("STOREL OOB");
+          stack[idx] = v;
+          break;
+        }
         case OP.ADD: stack.push((stack.pop()|0) + (stack.pop()|0)); break;
         case OP.SUB: { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a-b); break; }
         case OP.MUL: stack.push((stack.pop()|0) * (stack.pop()|0)); break;
@@ -218,9 +238,10 @@ if (a % b == 1) {
   }
 
   // ---------------- Codegen ----------------
-  // Strategy: map each identifier -> slot index (0..N-1). Stack machine for expressions.
+  // Strategy: assign each identifier a local slot (0..N-1) and place all locals in a frame created by ENTER N.
   function compile(ast){
-    const code = [];
+    const body = [];         // emit into body; we'll prepend ENTER later
+    const code = body;       // alias
     const slots = new Map(); // name -> slot
     const slotOf = (name)=> {
       if(!slots.has(name)) slots.set(name, slots.size);
@@ -239,7 +260,7 @@ if (a % b == 1) {
     function genExpr(n){
       switch(n.t){
         case "num": emit(OP.PUSH, n.v|0); break;
-        case "var": emit(OP.LOAD, slotOf(n.name)); break;
+        case "var": emit(OP.LOADL, slotOf(n.name)); break;
         case "un":
           genExpr(n.e);
           if(n.op==="-") emit(OP.NEG);
@@ -269,8 +290,8 @@ if (a % b == 1) {
 
     function genStmt(s){
       switch(s.t){
-        case "let": genExpr(s.e); emit(OP.STORE, slotOf(s.id)); break;
-        case "asg": genExpr(s.e); emit(OP.STORE, slotOf(s.id)); break;
+        case "let": genExpr(s.e); emit(OP.STOREL, slotOf(s.id)); break;
+        case "asg": genExpr(s.e); emit(OP.STOREL, slotOf(s.id)); break;
         case "print": genExpr(s.e); emit(OP.PRINT); break;
         case "block": s.body.forEach(genStmt); break;
         case "if": {
@@ -303,11 +324,15 @@ if (a % b == 1) {
 
     ast.body.forEach(genStmt);
     emit(OP.HALT);
-    return {bytecode:new Uint8Array(code), slots};
-  }
 
-  // For VM, we keep locals in a JS array bound on run:
-  let thisFrame = []; // sneaky but fine for a single "main" frame
+    // Prepend ENTER <#locals>
+    const nlocals = slots.size|0;
+    const withEnter = [];
+    emit8(withEnter, OP.ENTER); emit32(withEnter, nlocals);
+    for (const b of body) withEnter.push(b);
+
+    return {bytecode:new Uint8Array(withEnter), slots};
+  }
 
   // ---------------- Disassembler (debug) ----------------
   function disasm(u8){
@@ -316,7 +341,7 @@ if (a % b == 1) {
     const opname = Object.fromEntries(Object.entries(OP).map(([k,v])=>[v,k]));
     while(ip<u8.length){
       const at=ip, op=u8[ip++], name=opname[op]||("OP_"+op);
-      if(op===OP.PUSH||op===OP.LOAD||op===OP.STORE||op===OP.JMP||op===OP.JZ){
+      if([OP.ENTER,OP.PUSH,OP.LOADL,OP.STOREL,OP.JMP,OP.JZ].includes(op)){
         const imm=r32();
         out.push((at+"").padStart(4," ") + ": " + name + " " + imm);
       } else {
@@ -338,8 +363,6 @@ if (a % b == 1) {
       const ast  = parse(toks);
       const {bytecode, slots} = compile(ast);
       dis.textContent = disasm(bytecode);
-      // set up a fresh frame = Int slots initialized to 0
-      thisFrame = Array.from({length: slots.size}, () => 0);
       runVM(bytecode, { stdout: s => out.textContent += s + "\n" });
     } catch (e){
       out.textContent = "Error: " + e.message;
