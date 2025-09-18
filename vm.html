@@ -1,0 +1,350 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Mini → Bytecode VM (in-browser)</title>
+<style>
+  body { font: 14px/1.35 system-ui, sans-serif; margin: 20px; }
+  textarea { width: 100%; height: 260px; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { background:#111; color:#eee; padding:12px; overflow:auto; }
+  button { padding:8px 12px; margin: 10px 0; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .col { min-width: 0; }
+</style>
+<h1>Mini → Bytecode → VM</h1>
+<p>Language features: <code>let x = ...;</code>, assignment, <code>print(expr);</code>, <code>if/else</code>, <code>while</code>, ints with + - * / % and comparisons (== != &lt; &lt;= &gt; &gt;=), unary <code>-</code>, <code>!</code>.</p>
+<div class="row">
+  <div class="col">
+    <h3>Source (Mini)</h3>
+    <textarea id="src">
+// factorial of 10
+let n = 10;
+let acc = 1;
+while (n > 1) {
+  acc = acc * n;
+  n = n - 1;
+}
+print(acc);
+
+// basics
+let a = 7;
+let b = 3;
+if (a % b == 1) {
+  print(100 + a * b);
+} else {
+  print(0);
+}
+    </textarea>
+    <button id="run">Compile & Run</button>
+  </div>
+  <div class="col">
+    <h3>Output</h3>
+    <pre id="out"></pre>
+    <details>
+      <summary>Disassembly</summary>
+      <pre id="dis"></pre>
+    </details>
+  </div>
+</div>
+<script>
+(() => {
+  // ---------------- Bytecode ISA ----------------
+  const OP = Object.freeze({
+    PUSH: 0x01,  // imm32
+    LOAD: 0x02,  // imm32 (slot)
+    STORE:0x03,  // imm32 (slot)
+    ADD:  0x10, SUB:0x11, MUL:0x12, DIV:0x13, MOD:0x14,
+    NEG:  0x15, NOT:0x16,
+    EQ:   0x20, NE: 0x21, LT: 0x22, LE: 0x23, GT: 0x24, GE: 0x25,
+    JMP:  0x30,  // rel imm32
+    JZ:   0x31,  // rel imm32 (pop cond; jump if zero)
+    PRINT:0x40,
+    HALT: 0xFF,
+  });
+
+  function emit8(a, v){ a.push(v & 0xFF); }
+  function emit32(a, v){ let x=v|0; for(let i=0;i<4;i++) emit8(a, (x>>> (8*i)) & 0xFF); }
+  function write32At(a, pos, v){ for(let i=0;i<4;i++){ a[pos+i]= (v>>> (8*i)) & 0xFF; } }
+
+  // ---------------- VM ----------------
+  function runVM(bytecode, {stdout}) {
+    const memI32 = new Int32Array(0); // not using a heap; locals are in slots via LOAD/STORE.
+    const stack = [];
+    let ip = 0;
+    const u8 = bytecode;
+    const read32 = () => { const v = u8[ip]|(u8[ip+1]<<8)|(u8[ip+2]<<16)|(u8[ip+3]<<24); ip+=4; return v|0; };
+
+    for(;;){
+      const op = u8[ip++]; switch(op){
+        case OP.PUSH: stack.push(read32()); break;
+        case OP.LOAD: { const s=read32(); stack.push(thisFrame[s]|0); break; }
+        case OP.STORE:{ const s=read32(); thisFrame[s]= (stack.pop()|0); break; }
+        case OP.ADD: stack.push((stack.pop()|0) + (stack.pop()|0)); break;
+        case OP.SUB: { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a-b); break; }
+        case OP.MUL: stack.push((stack.pop()|0) * (stack.pop()|0)); break;
+        case OP.DIV: { const b=stack.pop()|0, a=stack.pop()|0; stack.push((a/b)|0); break; }
+        case OP.MOD: { const b=stack.pop()|0, a=stack.pop()|0; stack.push((a%b)|0); break; }
+        case OP.NEG: stack.push(-(stack.pop()|0)); break;
+        case OP.NOT: stack.push((stack.pop()|0) ? 0 : 1); break;
+        case OP.EQ:  stack.push((stack.pop()|0) === (stack.pop()|0) ? 1:0); break;
+        case OP.NE:  stack.push((stack.pop()|0) !== (stack.pop()|0) ? 1:0); break;
+        case OP.LT:  { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a<b?1:0); break; }
+        case OP.LE:  { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a<=b?1:0); break; }
+        case OP.GT:  { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a>b?1:0); break; }
+        case OP.GE:  { const b=stack.pop()|0, a=stack.pop()|0; stack.push(a>=b?1:0); break; }
+        case OP.JMP: { const off=read32(); ip += off|0; break; }
+        case OP.JZ:  { const off=read32(); const v=stack.pop()|0; if(v===0) ip += off|0; break; }
+        case OP.PRINT: stdout(String(stack.pop()|0)); break;
+        case OP.HALT: return;
+        default: throw new Error("Bad opcode "+op+" at "+(ip-1));
+      }
+    }
+  }
+
+  // ---------------- Lexer ----------------
+  function lex(input){
+    const isWS=c=>/\s/.test(c);
+    const isAlpha=c=>/[A-Za-z_]/.test(c);
+    const isAlnum=c=>/[A-Za-z0-9_]/.test(c);
+    const tokens=[];
+    let i=0,line=1,col=1;
+
+    const adv=()=>{ const c=input[i++]; if(c==="\n"){line++;col=1;} else col++; return c; };
+    const peek=()=>input[i]??"\0";
+    while(i<input.length){
+      let c=peek();
+      if(isWS(c)){ adv(); continue; }
+      if(c==="/" && input[i+1]==="/"){ while(i<input.length && adv()!=="\n"); continue; }
+      if(isAlpha(c)){
+        let s=""; while(isAlnum(peek())) s+=adv();
+        const kind = (s==="let"||s==="if"||s==="else"||s==="while"||s==="print") ? s.toUpperCase() : "IDENT";
+        tokens.push({kind, val:s});
+        continue;
+      }
+      if(/[0-9]/.test(c)){
+        let s=""; while(/[0-9]/.test(peek())) s+=adv();
+        tokens.push({kind:"NUM", val:parseInt(s,10)|0}); continue;
+      }
+      // two-char ops
+      const two = c + (input[i+1]||"");
+      if(["==","!=", "<=", ">="].includes(two)){ adv(); adv(); tokens.push({kind:two}); continue; }
+      // one-char
+      const singles = "{}();=+-*/%<>!,"; 
+      if(singles.includes(c)){ tokens.push({kind:adv()}); continue; }
+      throw new Error(`Lex error at ${line}:${col} near '${c}'`);
+    }
+    tokens.push({kind:"EOF"});
+    return tokens;
+  }
+
+  // ---------------- Parser (Pratt) ----------------
+  // Grammar (informal):
+  // program := stmt*
+  // stmt := "let" IDENT "=" expr ";" | IDENT "=" expr ";" | "print" "(" expr ")" ";"
+  //       | "if" "(" expr ")" block ("else" block)?
+  //       | "while" "(" expr ")" block
+  // block := "{" stmt* "}" | stmt
+  // expr with precedence: unary(- !) > * / % > + - > < <= > >= > == !=
+  function parse(tokens){
+    let i=0;
+    const peek=()=>tokens[i];
+    const eat=k=>{ if(peek().kind===k){ return tokens[i++]; } throw new Error(`Expected ${k}, got ${peek().kind}`); };
+    const match=k=> (peek().kind===k ? (i++, true): false);
+
+    const PRE = {
+      "==":1,"!=":1,"<":2,"<=":2,">":2,">=":2,
+      "+":3,"-":3,"*":4,"/":4,"%":4
+    };
+    function parsePrimary(){
+      const t=peek();
+      if(t.kind==="NUM"){ i++; return {t:"num", v:t.val}; }
+      if(t.kind==="IDENT"){ i++; return {t:"var", name:t.val}; }
+      if(match("(")){ const e=parseExpr(0); eat(")"); return e; }
+      if(match("!")){ return {t:"un", op:"!", e:parsePrimary()}; }
+      if(match("-")){ return {t:"un", op:"-", e:parsePrimary()}; }
+      throw new Error("Primary expected, got "+t.kind);
+    }
+    function parseExpr(minBP){
+      let lhs=parsePrimary();
+      for(;;){
+        const op=peek().kind;
+        if(!(op in PRE)) break;
+        const bp=PRE[op];
+        if(bp<minBP) break;
+        i++; // consume op
+        const rhs=parseExpr(bp+1);
+        lhs={t:"bin", op, a:lhs, b:rhs};
+      }
+      return lhs;
+    }
+
+    function parseBlockOrStmt(){
+      if(match("{")){
+        const body=[];
+        while(!match("}")) body.push(parseStmt());
+        return {t:"block", body};
+      }
+      return parseStmt();
+    }
+
+    function parseStmt(){
+      if(match("LET")){
+        const id=eat("IDENT").val; eat("="); const e=parseExpr(0); eat(";");
+        return {t:"let", id, e};
+      }
+      if(peek().kind==="IDENT" && tokens[i+1]?.kind==="="){
+        const id=eat("IDENT").val; eat("="); const e=parseExpr(0); eat(";");
+        return {t:"asg", id, e};
+      }
+      if(match("PRINT")){
+        eat("("); const e=parseExpr(0); eat(")"); eat(";");
+        return {t:"print", e};
+      }
+      if(match("IF")){
+        eat("("); const c=parseExpr(0); eat(")");
+        const th=parseBlockOrStmt();
+        let el=null; if(match("ELSE")) el=parseBlockOrStmt();
+        return {t:"if", c, th, el};
+      }
+      if(match("WHILE")){
+        eat("("); const c=parseExpr(0); eat(")");
+        const body=parseBlockOrStmt();
+        return {t:"while", c, body};
+      }
+      throw new Error("Statement expected, got "+peek().kind);
+    }
+
+    const body=[];
+    while(peek().kind!=="EOF") body.push(parseStmt());
+    return {t:"prog", body};
+  }
+
+  // ---------------- Codegen ----------------
+  // Strategy: map each identifier -> slot index (0..N-1). Stack machine for expressions.
+  function compile(ast){
+    const code = [];
+    const slots = new Map(); // name -> slot
+    const slotOf = (name)=> {
+      if(!slots.has(name)) slots.set(name, slots.size);
+      return slots.get(name)|0;
+    };
+
+    const emit = (op, imm=null) => { emit8(code, op); if(imm!==null) emit32(code, imm|0); };
+    const jmpHere = (op)=> { emit8(code, op); const pos=code.length; emit32(code, 0); return pos; };
+    const patchRel = (at) => { // at points to 4-byte rel imm after opcode
+      // displacement = target_ip - next_ip
+      const next = at + 4;
+      const disp = (code.length - next)|0;
+      write32At(code, at, disp);
+    };
+
+    function genExpr(n){
+      switch(n.t){
+        case "num": emit(OP.PUSH, n.v|0); break;
+        case "var": emit(OP.LOAD, slotOf(n.name)); break;
+        case "un":
+          genExpr(n.e);
+          if(n.op==="-") emit(OP.NEG);
+          else if(n.op==="!") emit(OP.NOT);
+          else throw new Error("bad unary "+n.op);
+          break;
+        case "bin":
+          genExpr(n.a); genExpr(n.b);
+          switch(n.op){
+            case "+": emit(OP.ADD); break;
+            case "-": emit(OP.SUB); break;
+            case "*": emit(OP.MUL); break;
+            case "/": emit(OP.DIV); break;
+            case "%": emit(OP.MOD); break;
+            case "==": emit(OP.EQ); break;
+            case "!=": emit(OP.NE); break;
+            case "<": emit(OP.LT); break;
+            case "<=": emit(OP.LE); break;
+            case ">": emit(OP.GT); break;
+            case ">=": emit(OP.GE); break;
+            default: throw new Error("bin op "+n.op);
+          }
+          break;
+        default: throw new Error("expr node "+n.t);
+      }
+    }
+
+    function genStmt(s){
+      switch(s.t){
+        case "let": genExpr(s.e); emit(OP.STORE, slotOf(s.id)); break;
+        case "asg": genExpr(s.e); emit(OP.STORE, slotOf(s.id)); break;
+        case "print": genExpr(s.e); emit(OP.PRINT); break;
+        case "block": s.body.forEach(genStmt); break;
+        case "if": {
+          genExpr(s.c);
+          const jz = jmpHere(OP.JZ);   // if !cond jump to else/after
+          genStmt(s.th);
+          if(s.el){
+            const jmp = jmpHere(OP.JMP); // skip else
+            patchRel(jz);
+            genStmt(s.el);
+            patchRel(jmp);
+          } else {
+            patchRel(jz);
+          }
+          break;
+        }
+        case "while": {
+          const loopTop = code.length;
+          genExpr(s.c);
+          const jz = jmpHere(OP.JZ); // exit if !cond
+          genStmt(s.body);
+          const back = (loopTop - (code.length + 5)) | 0; // 1(op)+4(imm) after emit
+          emit(OP.JMP, back);
+          patchRel(jz);
+          break;
+        }
+        default: throw new Error("stmt node "+s.t);
+      }
+    }
+
+    ast.body.forEach(genStmt);
+    emit(OP.HALT);
+    return {bytecode:new Uint8Array(code), slots};
+  }
+
+  // For VM, we keep locals in a JS array bound on run:
+  let thisFrame = []; // sneaky but fine for a single "main" frame
+
+  // ---------------- Disassembler (debug) ----------------
+  function disasm(u8){
+    let ip=0, out=[];
+    const r32=()=>{ const v=u8[ip]|(u8[ip+1]<<8)|(u8[ip+2]<<16)|(u8[ip+3]<<24); ip+=4; return v|0; };
+    const opname = Object.fromEntries(Object.entries(OP).map(([k,v])=>[v,k]));
+    while(ip<u8.length){
+      const at=ip, op=u8[ip++], name=opname[op]||("OP_"+op);
+      if(op===OP.PUSH||op===OP.LOAD||op===OP.STORE||op===OP.JMP||op===OP.JZ){
+        const imm=r32();
+        out.push((at+"").padStart(4," ") + ": " + name + " " + imm);
+      } else {
+        out.push((at+"").padStart(4," ") + ": " + name);
+      }
+      if(op===OP.HALT) break;
+    }
+    return out.join("\n");
+  }
+
+  // ---------------- UI wiring ----------------
+  const $ = sel => document.querySelector(sel);
+  const out = $("#out"), dis = $("#dis");
+  $("#run").onclick = () => {
+    out.textContent = ""; dis.textContent = "";
+    const src = $("#src").value;
+    try{
+      const toks = lex(src);
+      const ast  = parse(toks);
+      const {bytecode, slots} = compile(ast);
+      dis.textContent = disasm(bytecode);
+      // set up a fresh frame = Int slots initialized to 0
+      thisFrame = Array.from({length: slots.size}, () => 0);
+      runVM(bytecode, { stdout: s => out.textContent += s + "\n" });
+    } catch (e){
+      out.textContent = "Error: " + e.message;
+      console.error(e);
+    }
+  };
+})();
+</script>
